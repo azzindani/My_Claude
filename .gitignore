@@ -1,0 +1,12 @@
+# Backups produced by install scripts
+*.bak-*
+
+# Local-only overrides
+home/.claude/settings.local.json
+home/.claude/.credentials.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
