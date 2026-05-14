@@ -19,16 +19,20 @@ param(
 $ErrorActionPreference = "Stop"
 
 # --- OS detection ---------------------------------------------------------
-# $IsWindows / $IsLinux / $IsMacOS exist in PS 7+. On Windows PowerShell 5.1,
-# they don't, so default $IsWindows to true and the others to false.
-if (-not (Test-Path Variable:IsWindows)) {
-    $script:IsWindows = $true
-    $script:IsLinux   = $false
-    $script:IsMacOS   = $false
+# $IsWindows / $IsLinux / $IsMacOS are automatic vars on PS 7+ but don't exist
+# on Windows PowerShell 5.1. Mirror them into our own names so we never assign
+# to the auto-vars (which is read-only on PS 7).
+$script:OnWindows = $true
+$script:OnLinux   = $false
+$script:OnMacOS   = $false
+if (Test-Path Variable:IsWindows) {
+    $script:OnWindows = [bool]$IsWindows
+    $script:OnLinux   = [bool]$IsLinux
+    $script:OnMacOS   = [bool]$IsMacOS
 }
 
 if (-not $ClaudeHome) {
-    if ($IsWindows) {
+    if ($OnWindows) {
         $ClaudeHome = Join-Path $env:USERPROFILE ".claude"
     } else {
         $ClaudeHome = Join-Path $env:HOME ".claude"
@@ -55,7 +59,7 @@ if (-not $Python) {
 }
 
 # --- Hook command (per-OS) ------------------------------------------------
-if ($IsWindows) {
+if ($OnWindows) {
     $HookScript  = Join-Path $ClaudeHome "hooks/ask-user-question-reminder.ps1"
     $HookCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookScript`""
     $HookShell   = "powershell"
@@ -69,6 +73,7 @@ Write-Host "Repo source : $Source"
 Write-Host "Target dir  : $ClaudeHome"
 Write-Host "Python      : $Python"
 Write-Host "Hook shell  : $HookShell"
+Write-Host "Force       : $(if ($Force) { 'yes (no backups)' } else { 'no (existing files backed up)' })"
 if ($DryRun) { Write-Host "DRY RUN -- no changes will be made" -ForegroundColor Yellow }
 Write-Host ""
 
@@ -88,8 +93,8 @@ function Backup-Existing($path) {
     }
 }
 
-function Json-Escape($s) {
-    # Escape backslashes first, then double quotes — order matters.
+function Format-JsonString($s) {
+    # Escape backslashes first, then double quotes -- order matters.
     ($s -replace '\\', '\\') -replace '"', '\"'
 }
 
@@ -113,10 +118,10 @@ function Install-File($srcFile) {
         $content = Get-Content $srcFile -Raw
         if ($relFwd.ToLower().EndsWith('.json')) {
             # JSON: every backslash in substituted values must be doubled.
-            $homeRepl = Json-Escape $ClaudeHome
-            $pyRepl   = Json-Escape $Python
-            $hookCmd  = Json-Escape $HookCommand
-            $hookSh   = Json-Escape $HookShell
+            $homeRepl = Format-JsonString $ClaudeHome
+            $pyRepl   = Format-JsonString $Python
+            $hookCmd  = Format-JsonString $HookCommand
+            $hookSh   = Format-JsonString $HookShell
         } else {
             $homeRepl = $ClaudeHome
             $pyRepl   = $Python
@@ -136,7 +141,7 @@ function Install-File($srcFile) {
         if (-not $DryRun) {
             Copy-Item $srcFile $dest -Force
             # Mark *.sh files executable on Unix-likes
-            if (-not $IsWindows -and $relFwd.EndsWith('.sh')) {
+            if (-not $OnWindows -and $relFwd.EndsWith('.sh')) {
                 & chmod +x $dest 2>$null
             }
         }

@@ -118,7 +118,7 @@ backup_existing() {
 
 install_file() {
     local src="$1"
-    local rel="${src#$SOURCE/}"
+    local rel="${src#"$SOURCE"/}"
     local dest="${CLAUDE_HOME}/${rel}"
     local dest_dir
     dest_dir="$(dirname "$dest")"
@@ -154,7 +154,7 @@ install_file() {
         if [ "$DRY_RUN" -eq 0 ]; then
             cp -a "$src" "$dest"
             case "$rel" in
-                *.sh|hooks/*.sh) chmod +x "$dest" ;;
+                *.sh) chmod +x "$dest" ;;
             esac
         fi
     fi

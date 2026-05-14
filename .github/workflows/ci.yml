@@ -13,51 +13,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: shellcheck (install.sh and bash hook)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: shellcheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck --severity=warning install.sh
           shellcheck --severity=warning home/.claude/hooks/ask-user-question-reminder.sh
           shellcheck --severity=warning home/.claude/statusline-command.sh
 
-      - name: PSScriptAnalyzer (install.ps1 and PowerShell hook)
+      - name: PSScriptAnalyzer
         shell: pwsh
         run: |
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
-          $issues  = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Error,Warning
-          $issues += Invoke-ScriptAnalyzer -Path home/.claude/hooks/ask-user-question-reminder.ps1 -Severity Error,Warning
+          # Write-Host is the right tool for an installer's user-facing output
+          # (the alternative, Write-Information, is invisible without
+          # -InformationAction Continue). Exclude that rule.
+          $excluded = @('PSAvoidUsingWriteHost')
+          $issues  = Invoke-ScriptAnalyzer -Path install.ps1 -Severity Error,Warning -ExcludeRule $excluded
+          $issues += Invoke-ScriptAnalyzer -Path home/.claude/hooks/ask-user-question-reminder.ps1 -Severity Error,Warning -ExcludeRule $excluded
           if ($issues) {
-              $issues | Format-Table -AutoSize
+              $issues | Format-Table -AutoSize -Wrap
               exit 1
           }
           Write-Host "PSScriptAnalyzer: clean"
 
       - name: Validate source settings.json template
-        run: |
-          python3 - <<'EOF'
-          import json, re, sys
-          raw = open('home/.claude/settings.json').read()
-          # The template uses {{...}} placeholders that aren't valid JSON. Render
-          # with stub values so we can still verify the structure parses.
-          rendered = (raw
-              .replace('{{CLAUDE_HOME}}',  '/tmp/claude')
-              .replace('{{PYTHON}}',       '/usr/bin/python3')
-              .replace('{{HOOK_COMMAND}}', 'bash /tmp/claude/hooks/h.sh')
-              .replace('{{HOOK_SHELL}}',   'bash'))
-          try:
-              json.loads(rendered)
-          except Exception as e:
-              print(f"settings.json template does not render to valid JSON: {e}", file=sys.stderr)
-              sys.exit(1)
-          # All placeholders must be known
-          unknown = set(re.findall(r'\{\{[^}]+\}\}', raw))
-          allowed = {'{{CLAUDE_HOME}}', '{{PYTHON}}', '{{HOOK_COMMAND}}', '{{HOOK_SHELL}}'}
-          extra = unknown - allowed
-          if extra:
-              print(f"unknown placeholders in settings.json: {extra}", file=sys.stderr)
-              sys.exit(1)
-          print("settings.json template OK")
-          EOF
+        run: python3 tools/validate_template.py home/.claude/settings.json
 
   install-test:
     name: Install on ${{ matrix.os }}
@@ -74,126 +58,77 @@ jobs:
         with:
           python-version: "3.x"
 
-      # ---------- Unix (Linux + macOS) ----------------------------------
-      - name: Run install.sh (dry run)
+      # ----- Unix (Linux + macOS) ---------------------------------------
+      - name: install.sh --dry-run
         if: runner.os != 'Windows'
         run: |
           chmod +x ./install.sh
           ./install.sh --claude-home "${RUNNER_TEMP}/test-claude" --dry-run
 
-      - name: Run install.sh
+      - name: install.sh
         if: runner.os != 'Windows'
         run: ./install.sh --claude-home "${RUNNER_TEMP}/test-claude"
 
-      - name: Validate install (Unix)
+      - name: Validate (Unix)
+        if: runner.os != 'Windows'
+        run: python3 tools/validate_install.py "${RUNNER_TEMP}/test-claude" bash
+
+      - name: Hook smoke test (Unix)
         if: runner.os != 'Windows'
         run: |
-          set -euo pipefail
-          DEST="${RUNNER_TEMP}/test-claude"
-
-          # Files that must exist
-          for f in \
-              settings.json \
-              statusline.py \
-              statusline.bat \
-              statusline.ps1 \
-              statusline-command.sh \
-              statusline_test.py \
-              hooks/ask-user-question-reminder.ps1 \
-              hooks/ask-user-question-reminder.sh
-          do
-              [ -f "$DEST/$f" ] || { echo "MISSING: $f"; exit 1; }
-          done
-          echo "all expected files present"
-
-          # JSON must parse and resolve to bash hook on Unix
-          python3 - <<EOF
-          import json, sys
-          d = json.load(open("${DEST}/settings.json"))
-          hook = d['hooks']['PreToolUse'][0]['hooks'][0]
-          assert hook['shell'] == 'bash', f"expected shell=bash, got {hook['shell']}"
-          assert hook['command'].startswith('bash '), f"unexpected command: {hook['command']}"
-          assert '{{' not in open("${DEST}/settings.json").read(), "unresolved placeholders"
-          print("settings.json validated:", hook)
-          EOF
-
-          # Bash hook must be executable and produce valid JSON output
-          [ -x "$DEST/hooks/ask-user-question-reminder.sh" ] || { echo "hook not executable"; exit 1; }
-          OUT="$(echo '{}' | bash "$DEST/hooks/ask-user-question-reminder.sh")"
-          echo "hook output: $OUT"
-          echo "$OUT" | python3 -c "import json, sys; json.loads(sys.stdin.read())"
-          echo "hook produces valid JSON"
-
-          # Statusline smoke test
-          OUT="$(echo '{"model":{"display_name":"opus-4-7"},"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":42}}' | python3 "$DEST/statusline.py")"
-          echo "statusline output:"
+          OUT="$(echo '{}' | bash "${RUNNER_TEMP}/test-claude/hooks/ask-user-question-reminder.sh")"
           echo "$OUT"
-          [ -n "$OUT" ] || { echo "empty statusline output"; exit 1; }
+          echo "$OUT" | python3 -c "import json, sys; json.loads(sys.stdin.read())"
 
-      # ---------- Windows ------------------------------------------------
-      - name: Run install.ps1 (dry run)
+      - name: Statusline smoke test (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          OUT="$(echo '{"model":{"display_name":"opus-4-7"},"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":42}}' | python3 "${RUNNER_TEMP}/test-claude/statusline.py")"
+          echo "$OUT"
+          test -n "$OUT"
+
+      - name: Re-install with --force (idempotency)
+        if: runner.os != 'Windows'
+        run: |
+          ./install.sh --claude-home "${RUNNER_TEMP}/test-claude" --force
+          python3 tools/validate_install.py "${RUNNER_TEMP}/test-claude" bash
+
+      # ----- Windows -----------------------------------------------------
+      - name: install.ps1 -DryRun
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./install.ps1 -ClaudeHome "$env:RUNNER_TEMP\test-claude" -DryRun
 
-      - name: Run install.ps1
+      - name: install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./install.ps1 -ClaudeHome "$env:RUNNER_TEMP\test-claude"
 
-      - name: Validate install (Windows)
+      - name: Validate (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python tools/validate_install.py "$env:RUNNER_TEMP\test-claude" powershell
+
+      - name: Hook smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $dest = "$env:RUNNER_TEMP\test-claude"
+          $out = "" | powershell -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\test-claude\hooks\ask-user-question-reminder.ps1"
+          Write-Host $out
+          $out | python -c "import json, sys; json.loads(sys.stdin.read())"
 
-          $expected = @(
-              "settings.json",
-              "statusline.py",
-              "statusline.bat",
-              "statusline.ps1",
-              "statusline-command.sh",
-              "statusline_test.py",
-              "hooks\ask-user-question-reminder.ps1",
-              "hooks\ask-user-question-reminder.sh"
-          )
-          foreach ($f in $expected) {
-              if (-not (Test-Path "$dest\$f")) { throw "MISSING: $f" }
-          }
-          Write-Host "all expected files present"
-
-          # JSON validation + Windows-specific shell expectation
-          $py = @"
-          import json, sys
-          d = json.load(open(r'$dest\settings.json'))
-          hook = d['hooks']['PreToolUse'][0]['hooks'][0]
-          assert hook['shell'] == 'powershell', f"expected shell=powershell, got {hook['shell']}"
-          assert 'powershell' in hook['command'].lower(), f"unexpected command: {hook['command']}"
-          assert '{{' not in open(r'$dest\settings.json').read(), "unresolved placeholders"
-          print('settings.json validated:', hook)
-          "@
-          python -c $py
-
-          # PowerShell hook smoke test
-          $hookOut = "" | powershell -NoProfile -ExecutionPolicy Bypass -File "$dest\hooks\ask-user-question-reminder.ps1"
-          Write-Host "hook output: $hookOut"
-          $py = "import json, sys; json.loads(sys.stdin.read())"
-          $hookOut | python -c $py
-          Write-Host "hook produces valid JSON"
-
-          # Statusline smoke test
-          $sample = '{"model":{"display_name":"opus-4-7"},"workspace":{"current_dir":"C:/tmp"},"context_window":{"used_percentage":42}}'
-          $slOut = $sample | python "$dest\statusline.py"
-          Write-Host "statusline output:"
-          Write-Host $slOut
-          if (-not $slOut) { throw "empty statusline output" }
-
-      - name: Re-run installer with --force (idempotency check)
-        if: runner.os != 'Windows'
-        run: ./install.sh --claude-home "${RUNNER_TEMP}/test-claude" --force
-
-      - name: Re-run installer with -Force (idempotency check)
+      - name: Statusline smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./install.ps1 -ClaudeHome "$env:RUNNER_TEMP\test-claude" -Force
+        run: |
+          $sample = '{"model":{"display_name":"opus-4-7"},"workspace":{"current_dir":"C:/tmp"},"context_window":{"used_percentage":42}}'
+          $out = $sample | python "$env:RUNNER_TEMP\test-claude\statusline.py"
+          Write-Host $out
+          if (-not $out) { throw "empty statusline output" }
+
+      - name: Re-install with -Force (idempotency)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./install.ps1 -ClaudeHome "$env:RUNNER_TEMP\test-claude" -Force
+          python tools/validate_install.py "$env:RUNNER_TEMP\test-claude" powershell
