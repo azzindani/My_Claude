@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-import sys, json, os, re, subprocess, time as _time
+import sys, json, os, re, subprocess, time as _time, shutil
 from datetime import datetime, timedelta
 
 try:
     data = json.load(sys.stdin)
 except Exception:
     data = {}
+
 
 RS  = "\033[0m"
 CY  = "\033[96m"
@@ -23,6 +24,30 @@ WEEK_BUDGET = 30.0
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 def vlen(s): return len(ANSI_RE.sub("", s))
+
+def _get_term_width(fallback=120):
+    try:
+        c = int(os.environ.get('COLUMNS', 0))
+        if c > 0: return c
+    except (TypeError, ValueError):
+        pass
+    # SSH_TTY is the actual PTY device path — queryable even in subprocesses
+    for tty_path in filter(None, [os.environ.get('SSH_TTY'), '/dev/tty']):
+        try:
+            fd = os.open(tty_path, os.O_RDONLY | os.O_NOCTTY)
+            try:    return os.get_terminal_size(fd).columns
+            finally: os.close(fd)
+        except OSError:
+            pass
+    # stderr fallback (works when it's still connected to the tty)
+    try:
+        return os.get_terminal_size(2).columns
+    except OSError:
+        pass
+    return fallback
+
+_tw = _get_term_width()
+PORTRAIT = _tw < 100
 def pad(s, w):
     n = w - vlen(s)
     return s + (" " * n if n > 0 else "")
@@ -279,44 +304,87 @@ except Exception:
     pass
 
 # ── Build lines ────────────────────────────────────────────────────────────
-LBL_W  = 5
-TOK_W  = 32
-COST_W = 12
-
+LBL_W = 5
 def label(s): return f"{DIM}{s:>{LBL_W}}{RS}"
 
-lines = []
+lines    = []
+pct_val  = used_pct if used_pct is not None else 0
 
-# Line 1 — header
-hdr = f"{BLD}{CY}{model}{RS}"
-if eff_str: hdr += f" {DIM}→{RS} {MG}{eff_str}{RS}"
-hdr += f"  {DIM}│{RS}  {YE}{dir_str}{RS}"
-if branch: hdr += f"  {DIM}⎇{RS} {BL}{branch}{RS}"
-lines.append(hdr)
+if PORTRAIT:
+    # ── Portrait / narrow layout (< 100 cols) ──────────────────────────────
+    BAR_C  = 10
+    INDENT = " " * (LBL_W + 2)  # aligns bar under the data values
 
-# Line 2 — ctx
-pct_val = used_pct if used_pct is not None else 0
-tok = f"{WH}{fmt_k(ctx_used)}{DIM}/{fmt_k(max_ctx)}{RS}"
-lines.append(f"{label('ctx')}  {pad(tok, TOK_W)}{pad('', COST_W)}{draw_bar(pct_val/100, 15)}")
+    # Line 1: model + effort + branch
+    hdr = f"{BLD}{CY}{model}{RS}"
+    if eff_str: hdr += f" {DIM}→{RS} {MG}{eff_str}{RS}"
+    if branch:  hdr += f"  {DIM}⎇{RS} {BL}{branch}{RS}"
+    lines.append(hdr)
 
-# Line 3 — 5h window  (▲ new+cache_w  ↺ cache reads  ▼ output)
-tok  = f"{GR}▲{fmt_k(win_inp_new)}{RS}  {RD}▼{fmt_k(win_out)}{RS}"
-if win_cache_r:
-    tok += f"  {DIM}↺{fmt_k(win_cache_r)}{RS}"
-cost = f"{AM}◆${win_cost:.4f}{RS}"
-if rl_5h_pct is not None:
-    lines.append(f"{label('5h')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(rl_5h_pct/100, 15)}{fmt_reset(rl_5h_reset)}")
+    # Line 2: directory, truncated from left to fit terminal width
+    max_dir = _tw - 2
+    trunc   = ("…" + dir_str[-(max_dir - 1):]) if len(dir_str) > max_dir else dir_str
+    lines.append(f"{YE}{trunc}{RS}")
+
+    # ctx: data line, then bar on its own line
+    tok = f"{WH}{fmt_k(ctx_used)}{DIM}/{fmt_k(max_ctx)}{RS}"
+    lines.append(f"{label('ctx')}  {tok}")
+    lines.append(f"{INDENT}{draw_bar(pct_val/100, BAR_C)}")
+
+    # 5h: data line, then bar on its own line (only when rate-limit % is known)
+    tok = f"{GR}▲{fmt_k(win_inp_new)}{RS}  {RD}▼{fmt_k(win_out)}{RS}"
+    if win_cache_r:
+        tok += f"  {DIM}↺{fmt_k(win_cache_r)}{RS}"
+    cost = f"{AM}◆${win_cost:.4f}{RS}"
+    lines.append(f"{label('5h')}  {tok}  {cost}")
+    if rl_5h_pct is not None:
+        lines.append(f"{INDENT}{draw_bar(rl_5h_pct/100, BAR_C)}{fmt_reset(rl_5h_reset)}")
+
+    # 7d: data line, then bar on its own line
+    tok  = f"{GR}▲{fmt_k(week_inp)}{RS}  {RD}▼{fmt_k(week_out)}{RS}"
+    cost = f"{AM}◆${week_cost:.4f}{RS}"
+    lines.append(f"{label('7d')}  {tok}  {cost}")
+    if rl_7d_pct is not None:
+        lines.append(f"{INDENT}{draw_bar(rl_7d_pct/100, BAR_C)}{fmt_reset(rl_7d_reset)}")
+    else:
+        ratio = min(1.0, week_cost / WEEK_BUDGET) if WEEK_BUDGET else 0
+        lines.append(f"{INDENT}{draw_bar(ratio, BAR_C)}")
+
 else:
-    lines.append(f"{label('5h')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}")
+    # ── Landscape layout (≥ 100 cols) — original wide format ───────────────
+    TOK_W  = 32
+    COST_W = 12
+    BAR_C  = 15
 
-# Line 4 — 7d  (▲ total effective input = new+cache  ▼ output)
-tok  = f"{GR}▲{fmt_k(week_inp)}{RS}  {RD}▼{fmt_k(week_out)}{RS}"
-cost = f"{AM}◆${week_cost:.4f}{RS}"
-if rl_7d_pct is not None:
-    lines.append(f"{label('7d')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(rl_7d_pct/100, 15)}{fmt_reset(rl_7d_reset)}")
-else:
-    ratio = min(1.0, week_cost / WEEK_BUDGET) if WEEK_BUDGET else 0
-    lines.append(f"{label('7d')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(ratio, 15)}")
+    # Line 1 — header
+    hdr = f"{BLD}{CY}{model}{RS}"
+    if eff_str: hdr += f" {DIM}→{RS} {MG}{eff_str}{RS}"
+    hdr += f"  {DIM}│{RS}  {YE}{dir_str}{RS}"
+    if branch: hdr += f"  {DIM}⎇{RS} {BL}{branch}{RS}"
+    lines.append(hdr)
+
+    # Line 2 — ctx
+    tok = f"{WH}{fmt_k(ctx_used)}{DIM}/{fmt_k(max_ctx)}{RS}"
+    lines.append(f"{label('ctx')}  {pad(tok, TOK_W)}{pad('', COST_W)}{draw_bar(pct_val/100, BAR_C)}")
+
+    # Line 3 — 5h window  (▲ new+cache_w  ↺ cache reads  ▼ output)
+    tok  = f"{GR}▲{fmt_k(win_inp_new)}{RS}  {RD}▼{fmt_k(win_out)}{RS}"
+    if win_cache_r:
+        tok += f"  {DIM}↺{fmt_k(win_cache_r)}{RS}"
+    cost = f"{AM}◆${win_cost:.4f}{RS}"
+    if rl_5h_pct is not None:
+        lines.append(f"{label('5h')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(rl_5h_pct/100, BAR_C)}{fmt_reset(rl_5h_reset)}")
+    else:
+        lines.append(f"{label('5h')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}")
+
+    # Line 4 — 7d  (▲ total effective input = new+cache  ▼ output)
+    tok  = f"{GR}▲{fmt_k(week_inp)}{RS}  {RD}▼{fmt_k(week_out)}{RS}"
+    cost = f"{AM}◆${week_cost:.4f}{RS}"
+    if rl_7d_pct is not None:
+        lines.append(f"{label('7d')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(rl_7d_pct/100, BAR_C)}{fmt_reset(rl_7d_reset)}")
+    else:
+        ratio = min(1.0, week_cost / WEEK_BUDGET) if WEEK_BUDGET else 0
+        lines.append(f"{label('7d')}  {pad(tok, TOK_W)}{pad(cost, COST_W)}{draw_bar(ratio, BAR_C)}")
 
 out_str = "\n".join(lines) + "\n"
 sys.stdout.buffer.write(out_str.encode("utf-8", errors="replace"))
