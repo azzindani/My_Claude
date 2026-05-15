@@ -31,15 +31,17 @@ def _get_term_width(fallback=120):
         if c > 0: return c
     except (TypeError, ValueError):
         pass
-    # SSH_TTY is the actual PTY device path — queryable even in subprocesses
-    for tty_path in filter(None, [os.environ.get('SSH_TTY'), '/dev/tty']):
-        try:
-            fd = os.open(tty_path, os.O_RDONLY | os.O_NOCTTY)
-            try:    return os.get_terminal_size(fd).columns
-            finally: os.close(fd)
-        except OSError:
-            pass
-    # stderr fallback (works when it's still connected to the tty)
+    # SSH_TTY / /dev/tty are Unix-only — O_NOCTTY doesn't exist on Windows
+    if os.name != 'nt':
+        _O_NOCTTY = getattr(os, 'O_NOCTTY', 0)
+        for tty_path in filter(None, [os.environ.get('SSH_TTY'), '/dev/tty']):
+            try:
+                fd = os.open(tty_path, os.O_RDONLY | _O_NOCTTY)
+                try:    return os.get_terminal_size(fd).columns
+                finally: os.close(fd)
+            except OSError:
+                pass
+    # stderr fallback (works when still connected to the tty)
     try:
         return os.get_terminal_size(2).columns
     except OSError:
